@@ -8,6 +8,8 @@ _swaymsg()
   types=(
     'get_workspaces'
     'get_seats'
+    'get_pointer'
+    'set_pointer_rate'
     'get_inputs'
     'get_outputs'
     'get_tree'

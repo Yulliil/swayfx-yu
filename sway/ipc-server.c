@@ -12,8 +12,10 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 #include <wayland-server-core.h>
+#include <wlr/types/wlr_cursor.h>
 #include "sway/commands.h"
 #include "sway/config.h"
 #include "sway/desktop/transaction.h"
@@ -21,6 +23,7 @@
 #include "sway/ipc-server.h"
 #include "sway/output.h"
 #include "sway/server.h"
+#include "sway/input/cursor.h"
 #include "sway/input/input-manager.h"
 #include "sway/input/keyboard.h"
 #include "sway/input/seat.h"
@@ -40,6 +43,13 @@ static struct wl_listener ipc_display_destroy;
 static const char ipc_magic[] = {'i', '3', '-', 'i', 'p', 'c'};
 
 #define IPC_HEADER_SIZE (sizeof(ipc_magic) + 8)
+#define IPC_POINTER_DEFAULT_RATE_HZ 60
+#define IPC_POINTER_MAX_RATE_HZ 120
+#define IPC_POINTER_STALL_TIMEOUT_MS 5000
+
+static double ipc_pointer_x;
+static double ipc_pointer_y;
+static uint64_t ipc_pointer_serial;
 
 struct ipc_client {
 	struct wl_event_source *event_source;
@@ -53,6 +63,16 @@ struct ipc_client {
 	// The following are for storing data between event_loop calls
 	uint32_t pending_length;
 	enum ipc_command_type pending_type;
+
+	// Pointer events use one replaceable slot containing a complete, unwritten
+	// frame. Once part of a frame is written, its remainder moves to the normal
+	// write buffer so that a newer event cannot corrupt the IPC byte stream.
+	struct wl_event_source *pointer_timer;
+	uint32_t pointer_rate_hz;
+	uint64_t pointer_sent_serial;
+	char *pointer_pending;
+	size_t pointer_pending_len;
+	uint64_t pointer_stalled_since;
 };
 
 int ipc_handle_connection(int fd, uint32_t mask, void *data);
@@ -63,6 +83,8 @@ void ipc_client_handle_command(struct ipc_client *client, uint32_t payload_lengt
 	enum ipc_command_type payload_type);
 bool ipc_send_reply(struct ipc_client *client, enum ipc_command_type payload_type,
 	const char *payload, uint32_t payload_length);
+static bool ipc_client_flush(struct ipc_client *client);
+static bool ipc_pointer_subscribe(struct ipc_client *client);
 
 static void handle_display_destroy(struct wl_listener *listener, void *data) {
 	if (ipc_event_source) {
@@ -170,7 +192,7 @@ int ipc_handle_connection(int fd, uint32_t mask, void *data) {
 		return 0;
 	}
 
-	struct ipc_client *client = malloc(sizeof(struct ipc_client));
+	struct ipc_client *client = calloc(1, sizeof(struct ipc_client));
 	if (!client) {
 		sway_log(SWAY_ERROR, "Unable to allocate ipc client");
 		close(client_fd);
@@ -180,6 +202,7 @@ int ipc_handle_connection(int fd, uint32_t mask, void *data) {
 	client->pending_length = 0;
 	client->fd = client_fd;
 	client->subscribed_events = 0;
+	client->pointer_rate_hz = IPC_POINTER_DEFAULT_RATE_HZ;
 	client->event_source = wl_event_loop_add_fd(server->wl_event_loop,
 			client_fd, WL_EVENT_READABLE, ipc_client_handle_readable, client);
 	client->writable_event_source = NULL;
@@ -290,6 +313,111 @@ static void ipc_send_event(const char *json_string, enum ipc_command_type event)
 			i--;
 		}
 	}
+}
+
+static int ipc_pointer_interval_ms(struct ipc_client *client) {
+	// Round up so millisecond timers never exceed the configured maximum rate.
+	return (1000 + client->pointer_rate_hz - 1) / client->pointer_rate_hz;
+}
+
+static json_object *ipc_json_describe_pointer(double x, double y) {
+	json_object *json = json_object_new_object();
+	json_object_object_add(json, "x", json_object_new_double(x));
+	json_object_object_add(json, "y", json_object_new_double(y));
+	return json;
+}
+
+static bool ipc_default_pointer_position(double *x, double *y) {
+	struct sway_seat *seat = input_manager_get_default_seat();
+	if (!seat || !seat->cursor || !seat->cursor->cursor) {
+		return false;
+	}
+	*x = seat->cursor->cursor->x;
+	*y = seat->cursor->cursor->y;
+	return true;
+}
+
+void ipc_event_pointer(double x, double y) {
+	// Motion only publishes the latest value. Per-client timers do the sending.
+	if (ipc_pointer_serial != 0 && ipc_pointer_x == x && ipc_pointer_y == y) {
+		return;
+	}
+	ipc_pointer_x = x;
+	ipc_pointer_y = y;
+	ipc_pointer_serial++;
+}
+
+static bool ipc_pointer_queue(struct ipc_client *client) {
+	json_object *json = ipc_json_describe_pointer(ipc_pointer_x, ipc_pointer_y);
+	const char *payload = json_object_to_json_string(json);
+	uint32_t payload_length = strlen(payload);
+	size_t frame_length = IPC_HEADER_SIZE + payload_length;
+	char *frame = malloc(frame_length);
+	if (!frame) {
+		sway_log(SWAY_ERROR, "Unable to allocate pointer IPC frame");
+		json_object_put(json);
+		ipc_client_disconnect(client);
+		return false;
+	}
+
+	memcpy(frame, ipc_magic, sizeof(ipc_magic));
+	memcpy(frame + sizeof(ipc_magic), &payload_length, sizeof(payload_length));
+	enum ipc_command_type event = IPC_EVENT_POINTER;
+	memcpy(frame + sizeof(ipc_magic) + sizeof(payload_length),
+		&event, sizeof(event));
+	memcpy(frame + IPC_HEADER_SIZE, payload, payload_length);
+	json_object_put(json);
+
+	// This slot only ever contains a frame from which no bytes were written.
+	// Replacing it is therefore safe and keeps pointer backpressure bounded.
+	free(client->pointer_pending);
+	client->pointer_pending = frame;
+	client->pointer_pending_len = frame_length;
+	return ipc_client_flush(client);
+}
+
+static int ipc_pointer_timer_handler(void *data) {
+	struct ipc_client *client = data;
+	wl_event_source_timer_update(client->pointer_timer,
+		ipc_pointer_interval_ms(client));
+
+	if (client->pointer_sent_serial == ipc_pointer_serial) {
+		// No writable callback is generated while a socket remains full. Keep
+		// checking an existing backlog so a non-consuming client still times out.
+		if (client->write_buffer_len > 0 || client->pointer_pending) {
+			ipc_client_flush(client);
+		}
+		return 0;
+	}
+	client->pointer_sent_serial = ipc_pointer_serial;
+	ipc_pointer_queue(client);
+	return 0;
+}
+
+static bool ipc_pointer_subscribe(struct ipc_client *client) {
+	if (client->pointer_timer) {
+		return true;
+	}
+
+	double x, y;
+	if (!ipc_default_pointer_position(&x, &y)) {
+		return false;
+	}
+	ipc_event_pointer(x, y);
+
+	client->pointer_sent_serial = 0;
+	client->pointer_timer = wl_event_loop_add_timer(
+		client->server->wl_event_loop, ipc_pointer_timer_handler, client);
+	if (!client->pointer_timer) {
+		return false;
+	}
+	if (wl_event_source_timer_update(client->pointer_timer,
+			ipc_pointer_interval_ms(client)) != 0) {
+		wl_event_source_remove(client->pointer_timer);
+		client->pointer_timer = NULL;
+		return false;
+	}
+	return true;
 }
 
 void ipc_event_workspace(struct sway_workspace *old,
@@ -521,6 +649,123 @@ void ipc_event_output(void) {
 	json_object_put(json);
 }
 
+static uint64_t ipc_monotonic_ms(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static bool ipc_client_buffer_append(struct ipc_client *client,
+		const char *data, size_t length) {
+	while (client->write_buffer_len + length >= client->write_buffer_size) {
+		client->write_buffer_size *= 2;
+	}
+	if (client->write_buffer_size > 4e6) { // 4 MB
+		sway_log(SWAY_ERROR, "Client write buffer too big (%zu), disconnecting client",
+			client->write_buffer_size);
+		ipc_client_disconnect(client);
+		return false;
+	}
+
+	char *new_buffer = realloc(client->write_buffer, client->write_buffer_size);
+	if (!new_buffer) {
+		sway_log(SWAY_ERROR, "Unable to reallocate ipc client write buffer");
+		ipc_client_disconnect(client);
+		return false;
+	}
+	client->write_buffer = new_buffer;
+	memcpy(client->write_buffer + client->write_buffer_len, data, length);
+	client->write_buffer_len += length;
+	return true;
+}
+
+static bool ipc_client_flush(struct ipc_client *client) {
+	bool made_progress = false;
+
+	if (client->write_buffer_len > 0) {
+		ssize_t written = write(client->fd, client->write_buffer,
+			client->write_buffer_len);
+		if (written == -1 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+				errno == EINTR)) {
+			goto done;
+		} else if (written == -1) {
+			sway_log_errno(SWAY_INFO, "Unable to send data from queue to IPC client");
+			ipc_client_disconnect(client);
+			return false;
+		} else if (written > 0) {
+			memmove(client->write_buffer, client->write_buffer + written,
+				client->write_buffer_len - written);
+			client->write_buffer_len -= written;
+			made_progress = true;
+		}
+	}
+
+	if (client->write_buffer_len == 0 && client->pointer_pending) {
+		ssize_t written = write(client->fd, client->pointer_pending,
+			client->pointer_pending_len);
+		if (written == -1 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+				errno == EINTR)) {
+			goto done;
+		} else if (written == -1) {
+			sway_log_errno(SWAY_INFO, "Unable to send pointer event to IPC client");
+			ipc_client_disconnect(client);
+			return false;
+		} else if ((size_t)written == client->pointer_pending_len) {
+			free(client->pointer_pending);
+			client->pointer_pending = NULL;
+			client->pointer_pending_len = 0;
+			made_progress = true;
+		} else if (written > 0) {
+			// A partially written frame cannot be replaced. Preserve its unwritten
+			// remainder in the normal queue; subsequent pointer events still use
+			// the single replaceable slot.
+			size_t remainder = client->pointer_pending_len - written;
+			if (!ipc_client_buffer_append(client,
+					client->pointer_pending + written, remainder)) {
+				return false;
+			}
+			free(client->pointer_pending);
+			client->pointer_pending = NULL;
+			client->pointer_pending_len = 0;
+			made_progress = true;
+		}
+	}
+
+done:
+	if (client->write_buffer_len > 0 || client->pointer_pending) {
+		if (!client->writable_event_source) {
+			client->writable_event_source = wl_event_loop_add_fd(
+				server.wl_event_loop, client->fd, WL_EVENT_WRITABLE,
+				ipc_client_handle_writable, client);
+			if (!client->writable_event_source) {
+				sway_log(SWAY_ERROR, "Unable to monitor IPC client for writability");
+				ipc_client_disconnect(client);
+				return false;
+			}
+		}
+	} else if (client->writable_event_source) {
+		wl_event_source_remove(client->writable_event_source);
+		client->writable_event_source = NULL;
+	}
+
+	if (client->pointer_timer &&
+			(client->write_buffer_len > 0 || client->pointer_pending) &&
+			!made_progress) {
+		uint64_t now = ipc_monotonic_ms();
+		if (client->pointer_stalled_since == 0) {
+			client->pointer_stalled_since = now;
+		} else if (now - client->pointer_stalled_since >=
+				IPC_POINTER_STALL_TIMEOUT_MS) {
+			sway_log(SWAY_INFO, "Closing IPC client with stalled pointer events");
+			ipc_client_disconnect(client);
+			return false;
+		}
+	} else {
+		client->pointer_stalled_since = 0;
+	}
+	return true;
+}
+
 int ipc_client_handle_writable(int client_fd, uint32_t mask, void *data) {
 	struct ipc_client *client = data;
 
@@ -535,28 +780,7 @@ int ipc_client_handle_writable(int client_fd, uint32_t mask, void *data) {
 		return 0;
 	}
 
-	if (client->write_buffer_len <= 0) {
-		return 0;
-	}
-
-	ssize_t written = write(client->fd, client->write_buffer, client->write_buffer_len);
-
-	if (written == -1 && errno == EAGAIN) {
-		return 0;
-	} else if (written == -1) {
-		sway_log_errno(SWAY_INFO, "Unable to send data from queue to IPC client");
-		ipc_client_disconnect(client);
-		return 0;
-	}
-
-	memmove(client->write_buffer, client->write_buffer + written, client->write_buffer_len - written);
-	client->write_buffer_len -= written;
-
-	if (client->write_buffer_len == 0 && client->writable_event_source) {
-		wl_event_source_remove(client->writable_event_source);
-		client->writable_event_source = NULL;
-	}
-
+	ipc_client_flush(client);
 	return 0;
 }
 
@@ -572,11 +796,15 @@ void ipc_client_disconnect(struct ipc_client *client) {
 	if (client->writable_event_source) {
 		wl_event_source_remove(client->writable_event_source);
 	}
+	if (client->pointer_timer) {
+		wl_event_source_remove(client->pointer_timer);
+	}
 	int i = 0;
 	while (i < ipc_client_list->length && ipc_client_list->items[i] != client) {
 		i++;
 	}
 	list_del(ipc_client_list, i);
+	free(client->pointer_pending);
 	free(client->write_buffer);
 	close(client->fd);
 	free(client);
@@ -727,6 +955,55 @@ void ipc_client_handle_command(struct ipc_client *client, uint32_t payload_lengt
 		goto exit_cleanup;
 	}
 
+	case IPC_GET_POINTER:
+	{
+		double x, y;
+		if (!ipc_default_pointer_position(&x, &y)) {
+			const char msg[] = "{\"success\": false, \"error\": \"No pointer available\"}";
+			ipc_send_reply(client, payload_type, msg, strlen(msg));
+			goto exit_cleanup;
+		}
+		json_object *json = ipc_json_describe_pointer(x, y);
+		const char *json_string = json_object_to_json_string(json);
+		ipc_send_reply(client, payload_type, json_string,
+			(uint32_t)strlen(json_string));
+		json_object_put(json);
+		goto exit_cleanup;
+	}
+
+	case IPC_SET_POINTER_RATE:
+	{
+		json_object *request = json_tokener_parse(buf);
+		json_object *rate = NULL;
+		bool valid = request && json_object_is_type(request, json_type_object) &&
+			json_object_object_get_ex(request, "rate_hz", &rate) &&
+			json_object_is_type(rate, json_type_int);
+		int64_t rate_hz = valid ? json_object_get_int64(rate) : 0;
+		valid = valid && rate_hz >= 1 && rate_hz <= IPC_POINTER_MAX_RATE_HZ;
+		if (request) {
+			json_object_put(request);
+		}
+		if (!valid) {
+			const char msg[] = "{\"success\": false, \"error\": "
+				"\"rate_hz must be an integer between 1 and 120\"}";
+			ipc_send_reply(client, payload_type, msg, strlen(msg));
+			goto exit_cleanup;
+		}
+
+		client->pointer_rate_hz = (uint32_t)rate_hz;
+		if (client->pointer_timer && wl_event_source_timer_update(
+				client->pointer_timer, ipc_pointer_interval_ms(client)) != 0) {
+			const char msg[] = "{\"success\": false, \"error\": \"Unable to reset pointer timer\"}";
+			ipc_send_reply(client, payload_type, msg, strlen(msg));
+			goto exit_cleanup;
+		}
+		char reply[64];
+		int length = snprintf(reply, sizeof(reply),
+			"{\"success\": true, \"rate_hz\": %u}", client->pointer_rate_hz);
+		ipc_send_reply(client, payload_type, reply, length);
+		goto exit_cleanup;
+	}
+
 	case IPC_SUBSCRIBE:
 	{
 		// TODO: Check if they're permitted to use these events
@@ -739,6 +1016,7 @@ void ipc_client_handle_command(struct ipc_client *client, uint32_t payload_lengt
 		}
 
 		bool is_tick = false;
+		bool is_pointer = false;
 		// parse requested event types
 		for (size_t i = 0; i < json_object_array_length(request); i++) {
 			const char *event_type = json_object_get_string(json_object_array_get_idx(request, i));
@@ -763,6 +1041,9 @@ void ipc_client_handle_command(struct ipc_client *client, uint32_t payload_lengt
 				is_tick = true;
 			} else if (strcmp(event_type, "input") == 0) {
 				client->subscribed_events |= event_mask(IPC_EVENT_INPUT);
+			} else if (strcmp(event_type, "pointer") == 0) {
+				client->subscribed_events |= event_mask(IPC_EVENT_POINTER);
+				is_pointer = true;
 			} else {
 				const char msg[] = "{\"success\": false}";
 				ipc_send_reply(client, payload_type, msg, strlen(msg));
@@ -773,6 +1054,12 @@ void ipc_client_handle_command(struct ipc_client *client, uint32_t payload_lengt
 		}
 
 		json_object_put(request);
+		if (is_pointer && !ipc_pointer_subscribe(client)) {
+			client->subscribed_events &= ~event_mask(IPC_EVENT_POINTER);
+			const char msg[] = "{\"success\": false, \"error\": \"Unable to initialize pointer subscription\"}";
+			ipc_send_reply(client, payload_type, msg, strlen(msg));
+			goto exit_cleanup;
+		}
 		const char msg[] = "{\"success\": true}";
 		ipc_send_reply(client, payload_type, msg, strlen(msg));
 		if (is_tick) {
@@ -942,30 +1229,10 @@ bool ipc_send_reply(struct ipc_client *client, enum ipc_command_type payload_typ
 	memcpy(data + sizeof(ipc_magic), &payload_length, sizeof(payload_length));
 	memcpy(data + sizeof(ipc_magic) + sizeof(payload_length), &payload_type, sizeof(payload_type));
 
-	while (client->write_buffer_len + IPC_HEADER_SIZE + payload_length >=
-				 client->write_buffer_size) {
-		client->write_buffer_size *= 2;
-	}
-
-	if (client->write_buffer_size > 4e6) { // 4 MB
-		sway_log(SWAY_ERROR, "Client write buffer too big (%zu), disconnecting client",
-				client->write_buffer_size);
-		ipc_client_disconnect(client);
+	if (!ipc_client_buffer_append(client, data, IPC_HEADER_SIZE) ||
+			!ipc_client_buffer_append(client, payload, payload_length)) {
 		return false;
 	}
-
-	char *new_buffer = realloc(client->write_buffer, client->write_buffer_size);
-	if (!new_buffer) {
-		sway_log(SWAY_ERROR, "Unable to reallocate ipc client write buffer");
-		ipc_client_disconnect(client);
-		return false;
-	}
-	client->write_buffer = new_buffer;
-
-	memcpy(client->write_buffer + client->write_buffer_len, data, IPC_HEADER_SIZE);
-	client->write_buffer_len += IPC_HEADER_SIZE;
-	memcpy(client->write_buffer + client->write_buffer_len, payload, payload_length);
-	client->write_buffer_len += payload_length;
 
 	if (!client->writable_event_source) {
 		client->writable_event_source = wl_event_loop_add_fd(

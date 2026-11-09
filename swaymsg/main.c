@@ -532,6 +532,10 @@ int main(int argc, char **argv) {
 		type = IPC_GET_WORKSPACES;
 	} else if (strcasecmp(cmdtype, "get_seats") == 0) {
 		type = IPC_GET_SEATS;
+	} else if (strcasecmp(cmdtype, "get_pointer") == 0) {
+		type = IPC_GET_POINTER;
+	} else if (strcasecmp(cmdtype, "set_pointer_rate") == 0) {
+		type = IPC_SET_POINTER_RATE;
 	} else if (strcasecmp(cmdtype, "get_inputs") == 0) {
 		type = IPC_GET_INPUTS;
 	} else if (strcasecmp(cmdtype, "get_outputs") == 0) {

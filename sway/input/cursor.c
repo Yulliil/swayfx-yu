@@ -22,6 +22,7 @@
 #include "sway/input/cursor.h"
 #include "sway/input/keyboard.h"
 #include "sway/input/tablet.h"
+#include "sway/ipc-server.h"
 #include "sway/layers.h"
 #include "sway/output.h"
 #include "sway/scene_descriptor.h"
@@ -317,6 +318,9 @@ void pointer_motion(struct sway_cursor *cursor, uint32_t time_msec,
 	}
 
 	wlr_cursor_move(cursor->cursor, device, dx, dy);
+	if (cursor->seat == input_manager_get_default_seat()) {
+		ipc_event_pointer(cursor->cursor->x, cursor->cursor->y);
+	}
 
 	seatop_pointer_motion(cursor->seat, time_msec);
 }

@@ -82,6 +82,15 @@ _swaymsg_ [options...] [message]
 	Gets a list of all seats,
 	its properties and all assigned devices.
 
+*get\_pointer*
+	Gets the default seat pointer position in global output-layout coordinates.
+
+*set\_pointer\_rate*
+	Sets the maximum pointer event rate for the current IPC connection. The
+	message must be a JSON object such as _{"rate\_hz": 15}_. Since each
+	_swaymsg_ invocation opens a new connection, clients monitoring pointer
+	events should send this request on their existing subscription connection.
+
 *get\_marks*
 	Get a JSON-encoded list of marks.
 

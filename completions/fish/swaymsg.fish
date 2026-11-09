@@ -21,5 +21,7 @@ complete -c swaymsg -s t -l type -fra 'get_binding_modes' --description "Gets a 
 complete -c swaymsg -s t -l type -fra 'get_binding_state' --description "Get JSON-encoded info about the current binding state."
 complete -c swaymsg -s t -l type -fra 'get_config' --description "Gets a JSON-encoded copy of the current configuration."
 complete -c swaymsg -s t -l type -fra 'get_seats' --description "Gets a JSON-encoded list of all seats, its properties and all assigned devices."
+complete -c swaymsg -s t -l type -fra 'get_pointer' --description "Gets the pointer position in global output-layout coordinates."
+complete -c swaymsg -s t -l type -fra 'set_pointer_rate' --description "Sets the maximum pointer event rate for this IPC connection."
 complete -c swaymsg -s t -l type -fra 'send_tick' --description "Sends a tick event to all subscribed clients."
 complete -c swaymsg -s t -l type -fra 'subscribe' --description "Subscribe to a list of event types."

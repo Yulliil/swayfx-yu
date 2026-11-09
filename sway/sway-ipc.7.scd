@@ -84,6 +84,12 @@ supported. *For all replies, any properties not listed are subject to removal.*
 |- 101
 :  GET_SEATS
 :  Get the list of seats
+|- 102
+:  GET_POINTER
+:  Get the pointer position in global output-layout coordinates
+|- 103
+:  SET_POINTER_RATE
+:  Set the maximum pointer event rate for this IPC connection
 
 ## 0. RUN_COMMAND
 
@@ -1496,6 +1502,43 @@ one seat. Each object has the following properties:
 ]
 ```
 
+## 102. GET_POINTER
+
+*MESSAGE*++
+Retrieves the current pointer position for the default seat. The _x_ and _y_
+properties are JSON numbers in global output-layout coordinates.
+
+*REPLY*++
+```
+{
+	"x": 1280,
+	"y": 720
+}
+```
+
+## 103. SET_POINTER_RATE
+
+*MESSAGE*++
+Sets the maximum rate at which this IPC connection receives _pointer_ events.
+The payload must be a JSON object with an integer _rate_hz_ property from 1 to
+120. The default is 60 Hz. The setting can be changed before or after
+subscribing and applies only to the connection that sent this request.
+
+Changing the rate resets that connection's pointer timer. The rate is a cap,
+not a strict timer guarantee, and unchanged coordinates are not resent.
+
+*Example Message:*
+```
+{
+	"rate_hz": 15
+}
+```
+
+*REPLY*++
+A single object containing _success_ and, on success, the applied _rate_hz_.
+Invalid JSON, non-integer values, and values outside the supported range return
+_success_ set to _false_.
+
 # EVENTS
 
 Events are a way for clients to get notified of changes to sway. A client can
@@ -1538,6 +1581,9 @@ available:
 |- 0x80000015
 :  input
 :  Sent when something related to input devices changes
+|- 0x80000016
+:  pointer
+:  Sent at a configurable maximum rate when the pointer position changes
 
 
 ## 0x80000000. WORKSPACE
@@ -1932,6 +1978,32 @@ The following change types are currently available:
 			"send_events": "enabled"
 		}
 	}
+}
+```
+
+## 0x80000016. POINTER
+
+Subscribe to this event with _["pointer"]_. Each subscriber has an independent,
+resettable timer. Pointer motion updates only the latest global position; an
+expired timer sends that position if it has not already been queued by this
+subscriber. No motion is needed for the initial event, but unchanged coordinates
+are not sent repeatedly.
+
+The event contains the default seat pointer's _x_ and _y_ coordinates in the
+global output layout. Use _SET\_POINTER\_RATE_ on the same IPC connection to
+change the maximum event rate.
+
+Pointer delivery favors the latest value under backpressure. A complete pointer
+frame that has not started writing may be replaced by a newer frame. A partially
+written frame is completed to preserve IPC framing, with at most one newer
+pointer frame waiting behind it. Pointer events therefore do not accumulate
+without bound in the per-client write queue.
+
+*Example Event:*
+```
+{
+	"x": 1280,
+	"y": 720
 }
 ```
 
