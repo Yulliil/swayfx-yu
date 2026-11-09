@@ -1509,6 +1509,10 @@ Retrieves the current pointer position for the default seat. The _x_ and _y_
 properties are JSON numbers in global output-layout coordinates.
 
 *REPLY*++
+An object containing the current pointer coordinates.
+
+*Example Reply:*
+
 ```
 {
 	"x": 1280,
